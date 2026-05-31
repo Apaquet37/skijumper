@@ -1,218 +1,250 @@
-#include "NAxisMotion.h"
-#include "Wire.h"
+// Abby Paquette
+// ENGS 147 Ski Jumper Project
+
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <vl53l4cd_class.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <assert.h>
+
 #include "ArduinoMotorShieldR3.h"
 #include "AxisEncoderShield3.h"
+#include "NAxisMotion.h"        //Contains the bridge code between the API and the Arduino Environment
 
-#define DURATION 10000000
-#define TSAMPLE1 10000  // 1: 10,000 us = 10 ms = .01 s - for the compensator designed by discrete equivalent
-#define TSAMPLE2 100000 // 2: 400,000 us = 400 ms = .40 s - for the compensator designed by direct digital
-#define NSAMPLES (DURATION / TSAMPLE2)
-#define V_PWM_NPTS 18
-#define VMIN -9.65
-#define VMAX 9.33
-#define R 100         // reference speed updated from lab 2 to now, 100 rad/s
-#define A 0.07245     // two constants per difference equation to clean them up
-#define B 0.06755
-#define C 0.096
-#define D 0.048
+#define DEV_I2C Wire
+// #define LEDPIN 12
+#define SHUT_OFF_TIME 500000 // .5 seconds
+#define DESIRED_PWM 450
+#define XSHUT_PIN 4 // Connect to XSHUT on the sensor
 
 ArduinoMotorShieldR3 md;
+VL53L4CD sensor_vl53l4cd_sat(&DEV_I2C, XSHUT_PIN);
+NAxisMotion mySensor;                 //Object that for the sensor
+
+unsigned long lastStreamTime = 0;     //To store the last streamed time stamp
+//const int streamPeriod = 40;          //To stream at 25Hz without using additional timers (time period(ms) =1000/frequency(Hz))
+const int streamPeriod = 10; // 100 Hz, fastest I can get euler I think, so every 10 ms
+bool updateSensorData = true;         //Flag to update the sensor data. Default is true to perform the first read before the first stream
+
+
+enum State { // use a state machine 
+    ON_RAMP,
+    IN_AIR,
+    LANDED,
+    TIMEOUT
+};
+
+State currentState = ON_RAMP; // start on the ramp
+
+unsigned long startTime = 0;
+
 
 void setup() {
   // put your setup code here, to run once:
 
-  // peripheral initialization (initializing Serial connection)
+  // 1. Force Hardware Reset
+  pinMode(XSHUT_PIN, OUTPUT);
+  digitalWrite(XSHUT_PIN, LOW);   // Put sensor in shutdown mode
+  delay(10);                      // Hold reset
+  digitalWrite(XSHUT_PIN, HIGH);  // Wake sensor up
+  delay(10);                      // Wait for boot
+
+  // indicator LED
+  // pinMode(LEDPIN, OUTPUT);
+
+  // Initialize serial for output
   Serial.begin(115200);
-  I2C.begin();
+  Serial.println("Starting...");
 
-  // initialize the motor shield
-  md.init();
+  // Initialize I2C bus
+  DEV_I2C.begin();
 
-  // initialize the encoder shield - not super necessary to do it to read one channel in particular bc you can just call for the one channel to be read...?
-  initEncoderShield();
+  // Configure VL53L4CD satellite component
+  sensor_vl53l4cd_sat.begin();
 
-  // delay
-  delay(200);
+  // Switch off VL53L4CD satellite component
+  sensor_vl53l4cd_sat.VL53L4CD_Off();
+
+  //Initialize VL53L4CD satellite component
+  Serial.println("Line before initializing sensor"); 
+  sensor_vl53l4cd_sat.InitSensor();
+  Serial.println("sensor ready"); // often gets stuck initializing ToF sensor
+
+  // running very fast
+  sensor_vl53l4cd_sat.VL53L4CD_SetRangeTiming(10, 0);
+
+  // Start Measurements
+  sensor_vl53l4cd_sat.VL53L4CD_StartRanging();
+
+  md.init(); // initialize motor shield
+  initEncoderShield(); // initialize encoder shield
+  
+  
+  I2C.begin();                    //Initialize I2C communication to the let the library communicate with the sensor. 
+  //Sensor Initialization
+  mySensor.initSensor(0x28);          //The I2C Address can be changed here inside this function in the library
+  mySensor.setOperationMode(OPERATION_MODE_NDOF);   //Can be configured to other operation modes as desired
+  mySensor.setUpdateMode(MANUAL);	//The default is AUTO. Changing to manual requires calling the relevant update functions prior to calling the read functions
+  //Setting to MANUAL requires lesser reads to the sensor
+  mySensor.updateAccelConfig();
+  updateSensorData = true;
+  
+  delay(200); // ensure all config is complete
+
+  md.setM1Speed(0); // make sure motor starts off
+  // digitalWrite(LEDPIN, LOW); // led starts off
+
 }
 
 void loop() {
   // put your main code here, to run repeatedly:
-
-  // declare and initialize variables, including storage arrays
-
-  // arrays
-  long times[NSAMPLES];    
-  double position[NSAMPLES];  
-  double speed[NSAMPLES];
-  double eofs[NSAMPLES];
-  float vofs[NSAMPLES];
-  int uofs[NSAMPLES];  
-
-  // non-array(s)
-  unsigned long progstart, prevloopstart, curtime, time_idx, i;
-  int rofs;
-  double encoder1value, deltapos, dt;
-  float omegaofs;
-
-  // set reference step input
-  rofs = R;
-
-  // set motor pwm to 0 + delay
-  md.setM1Speed(0);
-  delay(1000);
-
-  // set timing variables going into the while loop
-  curtime = micros();
-  progstart = curtime;
-  prevloopstart = curtime;
-  time_idx = 0;
+  uint8_t NewDataReady = 0;
+  uint8_t validResults = 0;
+  VL53L4CD_Result_t results;
+  uint8_t status;
 
 
-  // // WHILE LOOP FOR DESIGN BY DISCRETE EQUIVALENT (comment out when using direct digital)
-  // while((curtime < progstart + DURATION) && (time_idx < NSAMPLES)) {
-  //   // update time
-  //   curtime = micros();
+  // status 1 means no new data, 0 means there is new data
+  do {
+    status = sensor_vl53l4cd_sat.VL53L4CD_CheckForDataReady(&NewDataReady);
+  } while (!NewDataReady);
 
-    
-  //   if((curtime - prevloopstart) >= TSAMPLE1) {
-      
-  //     // get encoder value to compute position
-  //     encoder1value = getEncoderValue(1);
-  //     times[time_idx] = curtime;
-  //     position[time_idx] = ((double)encoder1value / 1440.0) * (2.0 * PI); // this executes Theta(s)/X(s)
+  // if there is new data 
+  if ((!status) && (NewDataReady != 0)) {
+    // (Mandatory) Clear HW interrupt to restart measurements
+    sensor_vl53l4cd_sat.VL53L4CD_ClearInterrupt();
 
-  //     // calculate speed
-  //     if(time_idx == 0) {
-  //       speed[time_idx] = 0.0;
-  //       omegaofs = speed[time_idx];
-  //       eofs[time_idx] = rofs - omegaofs;
-  //       vofs[time_idx] = A*eofs[time_idx]; // is the right way to handle the first time through the ctrl loop to remove any past values from the equation?
-  //     } 
-  //     else {
-  //       deltapos = position[time_idx] - position[(time_idx-1)];
-  //       dt = ((double)times[time_idx] - (double)times[(time_idx-1)])/1000000.0;
-  //       speed[time_idx] = -(double)deltapos / (double)dt;
-  //       omegaofs = speed[time_idx];
-  //       eofs[time_idx] = rofs - omegaofs;
-  //       vofs[time_idx] = A*eofs[time_idx] - B*eofs[time_idx-1] + vofs[time_idx-1];
-  //     }
+    // Read measured distance. RangeStatus = 0 means valid data
+    sensor_vl53l4cd_sat.VL53L4CD_GetResult(&results);
 
-  //     // anti-windup - clamp V(s) to what the battery can provide
-  //     if (vofs[time_idx] > VMAX) vofs[time_idx] = VMAX;
-  //     if (vofs[time_idx] < VMIN) vofs[time_idx] = VMIN;
-    
-  //     // calculate U(s), using the function
-  //     uofs[time_idx] = vtopwm(vofs[time_idx]);
+    mySensor.updateAccel();        //Update the Accelerometer data
+    mySensor.updateLinearAccel();  //Update the Linear Acceleration data
+    mySensor.updateGravAccel();    //Update the Gravity Acceleration data
+    mySensor.updateCalibStatus();  //Update the Calibration Status
+    mySensor.updateEuler();
 
-  //     // set motor speed to U(s)
-  //     md.setM1Speed(uofs[time_idx]);
+    Serial.print("Time: ");
+    Serial.print(millis());
+    Serial.print("ms ");
 
-  //     // update timing and index
-  //     prevloopstart = curtime;
-  //     time_idx++;
-  //   }
-    
-  //   // update time
-  //   curtime = micros();
-  // }
+    Serial.print(" heading(yaw): ");
+    Serial.print(mySensor.readEulerHeading()); // Heading of the euler data
 
-  // WHILE LOOP FOR DESIGN BY DIRECT DIGITAL (comment out when using discrete equivalent)
-  while((curtime < progstart + DURATION) && (time_idx < NSAMPLES)) {
-    // update time
-    curtime = micros();
+    Serial.print(" roll: ");
+    Serial.print(mySensor.readEulerRoll());  // Roll of the euler data
 
-    if((curtime - prevloopstart) >= TSAMPLE2) {
-      
-      // get encoder value to compute position
-      encoder1value = getEncoderValue(1);
-      times[time_idx] = curtime;
-      position[time_idx] = ((double)encoder1value / 1440.0) * (2.0 * PI); // this executes Theta(s)/X(s)
+    Serial.print(" pitch: ");
+    Serial.print(mySensor.readEulerPitch());  // Pitch of the euler data
 
-      // calculate speed
-      if(time_idx == 0) {
-        speed[time_idx] = 0.0;
-        omegaofs = speed[time_idx];
-        eofs[time_idx] = rofs - omegaofs;
-        vofs[time_idx] = C*eofs[time_idx];  // is this the right way to handle the first pass...?
-      } 
-      else {
-        deltapos = position[time_idx] - position[(time_idx-1)];
-        dt = ((double)times[time_idx] - (double)times[(time_idx-1)])/1000000.0;
-        speed[time_idx] = -(double)deltapos / (double)dt;
-        omegaofs = speed[time_idx];
-        eofs[time_idx] = rofs - omegaofs;
-        vofs[time_idx] = C*eofs[time_idx] - D*eofs[time_idx-1] + vofs[time_idx-1];
-      }
+    Serial.print("      C: ");
+    Serial.print(mySensor.readAccelCalibStatus());  //Accelerometer Calibration Status (0 - 3)
 
-      if (vofs[time_idx] > VMAX) vofs[time_idx] = VMAX;
-      if (vofs[time_idx] < VMIN) vofs[time_idx] = VMIN;
+    Serial.println();
 
-      // store speed in Omega(s) (MOVED INSIDE IF STATEMENT)
-      // omegaofs = speed[time_idx];
-
-      // calculate E(s) (MOVED INSIDE IF STATEMENT)
-      // eofs[time_idx] = rofs - omegaofs;
-
-      // calculate V(s) using difference equation for the compensator's z-domain tf (MOVED INSIDE IF STATEMENT)
-      // vofs[time_idx] = A*eofs[time_idx] - A*B*eofs[time_idx-1] + vofs[time_idx-1];
-    
-      // calculate U(s), using the function
-      uofs[time_idx] = vtopwm(vofs[time_idx]);
-
-      // set motor speed to U(s)
-      md.setM1Speed(uofs[time_idx]);
-
-      // update timing and index
-      prevloopstart = curtime;
-      time_idx++;
+    // flag for valid data
+    if(results.range_status == 0){
+      validResults = 1;
     }
-    
-    // update time
-    curtime = micros();
-  }
-
-  // stop motor after data is collected
-  md.setM1Speed(0);
-
-  // print data in CSV format
-  Serial.println();
-  Serial.println("time_s,speed_rad_s,error_rad_s,ctrl_effort_V,pwm");
-  for(i=0;i<time_idx;i++){
-    Serial.print((double)times[i] / 1000000.0, 6);  // s
-    Serial.print(",");
-    Serial.print(speed[i],20);
-    Serial.print(",");
-    Serial.print(eofs[i], 6);
-    Serial.print(",");
-    Serial.print(vofs[i], 6);
-    Serial.print(",");
-    Serial.println(uofs[i]);
-  }
-
-  // forever loop to prevent re-running
-  while(true){
-  }
-}
-
-int vtopwm(float V) {
-  // hard-code (:() in V, pwm values from lab 1
-  float v_arr[V_PWM_NPTS] =  {-9.65,-9.48,-9.25,-9.0,-8.65,-8.17,-7.33,-6.45,-4.7,4.32,6.06,7.05,8.02,8.44,8.75,9.03,9.18,9.33};
-  float pwm_arr[V_PWM_NPTS] = {-400,-350,-300,-250,-200,-150,-100,-75,-50,50,75,100,150,200,250,300,350,400};
-  float slope;
-  int i, res_pwm;
-
-  // branch to find what linear-interp segment the passed-in V falls in
-  for (i=0;i<V_PWM_NPTS-1;i++){
-    // in loop, will run through comparing V to each next value; the last time it runs will be the last slope value saved
-    // extra logical OR ensures voltages larger than v_max from v_arr follow the slope between the last two points
-    if((V<v_arr[i+1]) || ((V > v_arr[i+1]) && (i==V_PWM_NPTS-2))){
-      slope = (float)(pwm_arr[i+1]-pwm_arr[i])/(v_arr[i+1]-v_arr[i]);
-      res_pwm = pwm_arr[i] + (int)(slope * (V-v_arr[i])+.5f);         // .5f to round to nearest integer
-      break;
+    else{
+      validResults = 0;
     }
   }
-  // ensure nothing below -400 or above 400 is returned
-  if(res_pwm < pwm_arr[0])                  res_pwm = pwm_arr[0];
-  else if (res_pwm > pwm_arr[V_PWM_NPTS-1]) res_pwm = pwm_arr[V_PWM_NPTS-1];
-  return(res_pwm);
+
+  if(validResults){ // only enter the state machine if there are existing and valid results
+    switch(currentState) {
+
+      case ON_RAMP:
+        // motor off
+        Serial.println("On ramp"); // debug
+        md.setM1Speed(0);
+        // digitalWrite(LEDPIN, LOW); // indicator led off
+
+
+        // switch condition is that it leaves the ramp
+        // could add in some debounce logic here to require two readings over 50
+        if(results.distance_mm > 50) {
+          currentState = IN_AIR;
+        
+          // debug
+          Serial.println("Was on ramp now is in air");
+
+          startTime = micros(); // take note of when motor turns on
+
+          // start motor
+          md.setM1Speed(DESIRED_PWM);
+          md.setM2Speed(DESIRED_PWM);
+          // digitalWrite(LEDPIN, HIGH); // indicator led on
+        }
+
+        break;
+
+      case IN_AIR:
+        // motor on - don't keep resending pwm command right now
+        // control will go here
+
+        //Serial.println("In air");  // debug
+        // digitalWrite(LEDPIN, HIGH); // indicator led on
+        // digitalWrite(LEDPIN, LOW); // indicator led on
+        md.setM1Speed(DESIRED_PWM);
+        md.setM2Speed(DESIRED_PWM);
+
+        
+        
+
+        // switch condition
+        // if(results.distance_mm < 100) {
+        //   currentState = LANDED;
+
+        //   Serial.println("Was in air now landed");
+          
+        //   // turn off motor
+        //   md.setM1Speed(0);
+        //   digitalWrite(LEDPIN, LOW); // indicator LED off
+        // }
+        // // also include a safety shutoff
+        // else if(micros() - startTime >= SHUT_OFF_TIME) {
+
+        //   currentState = TIMEOUT;
+
+        //   md.setM1Speed(0);
+        // }
+
+        break;
+
+      case LANDED:
+
+        // continue to have motor off
+        // redundant command, but here just in case
+        md.setM1Speed(0);
+      
+        Serial.println("Landed and motor off");
+
+        /*
+        // don't want this in this iteration, think if there should be a way to return to beginning
+        // condition shouldn't be distance based though
+        // think just pressing reset would be better
+        if(results.distance_mm < 50) {
+          currentState = ON_RAMP;
+        }
+        */
+        break;
+
+      // timeout and landed cases are currently the same, might collapse them into one, but for now preserving them as separate states
+      case TIMEOUT:
+
+        md.setM1Speed(0);
+
+        /*
+        if(results.distance_mm < 50) {
+            currentState = ON_RAMP;
+        }
+        */
+        break;
+    }
+  }
+
 }
