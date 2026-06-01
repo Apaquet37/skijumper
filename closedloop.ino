@@ -60,12 +60,13 @@ unsigned long startTime = 0;
 
 #define D .05
 #define F .025
-#define TS 10000 //10 ms
-#define NUM_SAMPLES 1000 // 1000 bc 10s/10ms
-#define RECORD_TIME 10000000 // 10s total duration of loop
+#define TS 50000 // 10 ms in microseconds
+#define RECORD_TIME 20000000 // 10 s total duration of loop, in microseconds
+#define NUM_SAMPLES (RECORD_TIME / TS)
 
 #define DEG_TO_RAD 0.0174533
 
+#define A 4
 
 
 
@@ -127,20 +128,22 @@ void setup() {
 void loop() {
   // declare and initialize variables including storage array(s)
   // variables (keep declarations here unless you *REALLY* need a global...)
-  unsigned long progstart, prevloopstart, curtime, dt;  // note: long is a long INTEGER!
-  bool running = false;                                 // allows us to enter TS if() block on first run through loop
-
-  float times[NUM_SAMPLES];
-  unsigned long timeidx = 0;
+  static unsigned long progstart, prevloopstart;
+  static bool running = false;                                 // allows us to enter TS if() block on first run through loop
+  static unsigned long timeidx = 0;
+  
+  static float times[NUM_SAMPLES];
+  static long encoders[NUM_SAMPLES]; // store raw encoder values
+  static float angle[NUM_SAMPLES]; // store converted radian values
+  static float velocities[NUM_SAMPLES]; // rad/s
+  static float velo_unconv[NUM_SAMPLES]; // pulse counts per microsecond
+  static float vSignal[NUM_SAMPLES]; // commanded voltages
+  static float pwmToSend[NUM_SAMPLES]; // commanded pwm values
+  static float error[NUM_SAMPLES]; // errors
+  
+  unsigned long curtime, dt;  // note: long is a long INTEGER!
   long encoderValue = 0;
-  long encoders[NUM_SAMPLES]; // store raw encoder values
-  float angle[NUM_SAMPLES]; // store converted radian values
   float velocity, velocityUnConverted = 0;
-  float velocities[NUM_SAMPLES]; // rad/s
-  float velo_unconv[NUM_SAMPLES]; // pulse counts per microsecond
-  float vSignal[NUM_SAMPLES]; // commanded voltages
-  float pwmToSend[NUM_SAMPLES]; // commanded pwm values
-  float error[NUM_SAMPLES]; // errors
   float refInput = 0;
 
   uint8_t NewDataReady = 0;
@@ -220,115 +223,69 @@ void loop() {
           Serial.println("Was on ramp now is in air");
 
           startTime = micros(); // take note of when motor turns on
-
-          // start motor
-          //md.setM1Speed(DESIRED_PWM);
-          //md.setM2Speed(DESIRED_PWM);
-          // digitalWrite(LEDPIN, HIGH); // indicator led on
+          progstart = startTime;
+          prevloopstart = startTime;
+          running = false; // reset for first control loop iteration
         }
 
         break;
 
       case IN_AIR:
-        // motor on - don't keep resending pwm command right now
-        // control will go here
+        // motor control loop - runs at TS frequency
+        curtime = micros();
 
-        //Serial.println("In air");  // debug
-        // digitalWrite(LEDPIN, HIGH); // indicator led on
-        // digitalWrite(LEDPIN, LOW); // indicator led on
-        // timed loop that repeats every 5ms for 10 total seconds
-  // collect data for 10 seconds
-  curtime = micros();
-  progstart = curtime;
-  prevloopstart = curtime;
+        // enforce loop timing
+        if (!running || (curtime - prevloopstart) >= TS) { // OR conditions - start or 10ms
 
+          // TIME CRITICAL OPERATIONS
+          // * read encoder (position ish) long
+          encoderValue = getEncoderValue(1);
+          // store time, position, and raw encoder values
+          times[timeidx] = ((float)curtime)*TIME_CONVERT; // in seconds
+          encoders[timeidx] = -encoderValue; // negative here because of direction of encoder vs motor
+          angle[timeidx] = (encoders[timeidx] - encoders[0])*SCALE; // turn into radians, make relative angle to start
 
-  //while (curtime < (progstart + RECORD_TIME)) {  // total duration
-      refInput = 0;
-    // if(curtime < (progstart + RECORD_TIME/4)){
-    //   refInput = 1.0472; // rad, 60 degrees
-    // }
-    // else if (curtime < (progstart + RECORD_TIME/2)){
-    //   refInput = 0; // switch halfway through to 0 degrees
-    // }
-    // else if (curtime < (progstart + 3*(RECORD_TIME/4))){
-    //   refInput = 1.0472; // switch halfway through to 0 degrees
-    // }
-    // else{
-    //   refInput = 0;
-    // }
+          //error[timeidx] = refInput - angle[timeidx]; // error in rad
+          error[timeidx] = refInput - rollRad; // error in rad
+          Serial.print("error:");
+          Serial.println(error[timeidx]);
 
-
-    // enforce loop timing
-    curtime = micros();
-    if (!running || (curtime - prevloopstart) >= TS) { // OR conditions - start or 10ms
-
-      // TIME CRITICAL OPERATIONS
-      // * read encoder (position ish) long
-      encoderValue = getEncoderValue(1);
-      // store time, position, and raw encoder values
-      times[timeidx] = ((float)curtime)*TIME_CONVERT; // in seconds
-      encoders[timeidx] = -encoderValue; // negative here because of direction of encoder vs motor
-      angle[timeidx] = (encoders[timeidx] - encoders[0])*SCALE; // turn into radians, make relative angle to start
-
-      //error[timeidx] = refInput - angle[timeidx]; // error in rad
-      error[timeidx] = refInput - rollRad; // error in rad
-      Serial.print("error:");
-      Serial.println(error[timeidx]);
-
-
-      // if(timeidx == 0){
-      //   vSignal[timeidx] = D*error[timeidx]; // ek-1 and vk-1 start at zero
-      // } else {
-      //   vSignal[timeidx] = vSignal[timeidx-1] + D*error[timeidx] - F*error[timeidx-1];
-      // } 
-
-      // just close loop, no compensator
-      vSignal[timeidx] = error[timeidx];
-      
-      pwmToSend[timeidx] = voltageToPWM(vSignal[timeidx]);
-
-      md.setM1Speed((int)pwmToSend[timeidx]);
-      md.setM2Speed((int)pwmToSend[timeidx]);
-
-      // increment indices, pointers, etc.
-      timeidx++;
-      // and take care of other items that are not time critical
-      running = true;
-      prevloopstart = curtime;  // absolute count of when this sampling period started
-
-      // check for sample time and array overruns if desired
-      if(timeidx>NUM_SAMPLES){
-        // stop running
-        Serial.println("Sample/array overrun");
-        while(1){}
-      }
-    }
-
-    // get current time for use in evaluating while() condition
-    curtime = micros();
-  //}
-
-
-        
-        
-
-        // switch condition
-        // if(results.distance_mm < 100) {
-        //   currentState = LANDED;
-
-        //   Serial.println("Was in air now landed");
+          // just close loop, no compensator
+          vSignal[timeidx] = A*error[timeidx];
           
-        //   // turn off motor
-        //   md.setM1Speed(0);
-        //   digitalWrite(LEDPIN, LOW); // indicator LED off
-        // }
-        // // also include a safety shutoff
-        // else if(micros() - startTime >= SHUT_OFF_TIME) {
+          pwmToSend[timeidx] = voltageToPWM(vSignal[timeidx]);
 
-        //   currentState = TIMEOUT;
+          md.setM1Speed((int)pwmToSend[timeidx]);
+          md.setM2Speed((int)pwmToSend[timeidx]);
 
+          // increment indices, pointers, etc.
+          timeidx++;
+          // and take care of other items that are not time critical
+          running = true;
+          prevloopstart = curtime;  // absolute count of when this sampling period started
+
+          // check for sample time and array overruns if desired
+          if(timeidx >= NUM_SAMPLES){
+            // stop running
+            Serial.println("Sample/array overrun");
+            md.setM1Speed(0);
+            md.setM2Speed(0);
+            currentState = LANDED; // exit to landed state
+          }
+        }
+
+        // Check for exit condition
+        if(curtime >= (progstart + RECORD_TIME)) {
+          currentState = LANDED;
+          Serial.println("Recording time complete, landing");
+          md.setM1Speed(0);
+          md.setM2Speed(0);
+        }
+        // else if(results.distance_mm < 100) {
+        //   currentState = LANDED;
+        //   Serial.println("Was in air now landed");
         //   md.setM1Speed(0);
+        //   md.setM2Speed(0);
         // }
 
         break;
@@ -365,10 +322,6 @@ void loop() {
     }
   }
 
-  
-  // stop motor
-  md.setM1Speed(0);
-  md.setM2Speed(0);
   // print all stored data to serial stream
   // Serial.println("Timestamp, Motor_angle, Error, Commanded_voltage, Commanded_pwm_value");
   // for(int i = 0; i<NUM_SAMPLES; i++){
