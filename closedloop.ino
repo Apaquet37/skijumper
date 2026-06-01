@@ -20,7 +20,6 @@ ArduinoMotorShieldR3 md;
 
 #define DEV_I2C Wire
 // #define LEDPIN 12
-#define SHUT_OFF_TIME 500000 // .5 seconds
 #define DESIRED_PWM 400
 #define XSHUT_PIN 4 // Connect to XSHUT on the sensor
 
@@ -60,13 +59,15 @@ unsigned long startTime = 0;
 
 #define D .05
 #define F .025
-#define TS 50000 // 10 ms in microseconds
+#define TS 10000 // 10 ms in microseconds
 #define RECORD_TIME 20000000 // 10 s total duration of loop, in microseconds
 #define NUM_SAMPLES (RECORD_TIME / TS)
 
 #define DEG_TO_RAD 0.0174533
 
-#define A 4
+#define GAIN 5.0 // K
+#define B .5 // pole location
+#define A .2 // zero location
 
 
 
@@ -131,6 +132,8 @@ void loop() {
   static unsigned long progstart, prevloopstart;
   static bool running = false;                                 // allows us to enter TS if() block on first run through loop
   static unsigned long timeidx = 0;
+  static uint16_t lastDistanceMm = 0;
+  static bool hasValidDistance = false;
   
   static float times[NUM_SAMPLES];
   static long encoders[NUM_SAMPLES]; // store raw encoder values
@@ -144,20 +147,32 @@ void loop() {
   unsigned long curtime, dt;  // note: long is a long INTEGER!
   long encoderValue = 0;
   float velocity, velocityUnConverted = 0;
-  float refInput = 0;
+  float refInput = 1.5;
 
   uint8_t NewDataReady = 0;
-  uint8_t validResults = 0;
+  bool tofMeasurementValid = false;
   VL53L4CD_Result_t results;
   uint8_t status;
 
   float rollRad = 0;
+  uint16_t distanceMm = lastDistanceMm;
 
+  mySensor.updateAccel();        //Update the Accelerometer data
+  //mySensor.updateLinearAccel();  //Update the Linear Acceleration data
+  //mySensor.updateGravAccel();    //Update the Gravity Acceleration data
+  mySensor.updateCalibStatus();  //Update the Calibration Status
+  mySensor.updateEuler();
 
-  // status 1 means no new data, 0 means there is new data
-  do {
-    status = sensor_vl53l4cd_sat.VL53L4CD_CheckForDataReady(&NewDataReady);
-  } while (!NewDataReady);
+  Serial.print(" roll: ");
+  Serial.print(mySensor.readEulerRoll());  // Roll of the euler data
+
+  rollRad = mySensor.readEulerRoll() * DEG_TO_RAD;
+
+  Serial.print(" pitch: ");
+  Serial.println(mySensor.readEulerPitch());  // Pitch of the euler data
+
+  // Non-blocking ToF polling: if the sensor stalls, continue running the rest of the code.
+  status = sensor_vl53l4cd_sat.VL53L4CD_CheckForDataReady(&NewDataReady);
 
   // if there is new data 
   if ((!status) && (NewDataReady != 0)) {
@@ -167,26 +182,9 @@ void loop() {
     // Read measured distance. RangeStatus = 0 means valid data
     sensor_vl53l4cd_sat.VL53L4CD_GetResult(&results);
 
-    mySensor.updateAccel();        //Update the Accelerometer data
-    //mySensor.updateLinearAccel();  //Update the Linear Acceleration data
-    //mySensor.updateGravAccel();    //Update the Gravity Acceleration data
-    mySensor.updateCalibStatus();  //Update the Calibration Status
-    mySensor.updateEuler();
-
     // Serial.print("Time: ");
     // Serial.print(millis());
     // Serial.print("ms ");
-
-    // Serial.print(" heading(yaw): ");
-    // Serial.print(mySensor.readEulerHeading()); // Heading of the euler data
-
-    Serial.print(" roll: ");
-    Serial.print(mySensor.readEulerRoll());  // Roll of the euler data
-
-    rollRad = mySensor.readEulerRoll() * DEG_TO_RAD;
-
-    Serial.print(" pitch: ");
-    Serial.println(mySensor.readEulerPitch());  // Pitch of the euler data
 
     // Serial.print("      C: ");
     // Serial.print(mySensor.readAccelCalibStatus());  //Accelerometer Calibration Status (0 - 3)
@@ -195,20 +193,20 @@ void loop() {
 
     // flag for valid data
     if(results.range_status == 0){
-      validResults = 1;
-    }
-    else{
-      validResults = 0;
+      tofMeasurementValid = true;
+      distanceMm = results.distance_mm;
+      lastDistanceMm = distanceMm;
+      hasValidDistance = true;
     }
   }
 
-    if(validResults){ // only enter the state machine if there are existing and valid results
-    switch(currentState) {
+  switch(currentState) {
 
       case ON_RAMP:
         // motor off
         Serial.println("On ramp"); // debug
         md.setM1Speed(0);
+        md.setM2Speed(0);
         Serial.println("here"); // debug
 
         // digitalWrite(LEDPIN, LOW); // indicator led off
@@ -216,7 +214,7 @@ void loop() {
 
         // switch condition is that it leaves the ramp
         // could add in some debounce logic here to require two readings over 50
-        if(results.distance_mm > 50) {
+        if(tofMeasurementValid && distanceMm > 50) {
           currentState = IN_AIR;
         
           // debug
@@ -250,8 +248,17 @@ void loop() {
           Serial.print("error:");
           Serial.println(error[timeidx]);
 
+
+          // compensator as difference equation
+          // if(timeidx == 0){
+          //   vSignal[timeidx] = GAIN*error[timeidx]; // ek-1 and vk-1 start at zero
+          // } else {
+          //   vSignal[timeidx] = B*vSignal[timeidx-1] + GAIN*error[timeidx] - A*GAIN*error[timeidx-1];
+          // } 
+
+
           // just close loop, no compensator
-          vSignal[timeidx] = A*error[timeidx];
+          vSignal[timeidx] = GAIN*error[timeidx];
           
           pwmToSend[timeidx] = voltageToPWM(vSignal[timeidx]);
 
@@ -319,7 +326,6 @@ void loop() {
         }
         */
         break;
-    }
   }
 
   // print all stored data to serial stream
@@ -343,7 +349,8 @@ void loop() {
 // U(s)/V(s)
 int voltageToPWM(float V) {
   // hard-coded V, pwm values from calibration
-  float v_arr[V_PWM_NPTS] =  {-8.73,-7.86,-7.33,-6.98,-6.65,-5.57,-4.70,-3.70,-2.48,2.77,3.90,4.82,5.61,6.74,7.39,7.87,8.76};
+  //float v_arr[V_PWM_NPTS] =  {-8.73,-7.86,-7.33,-6.98,-6.65,-5.57,-4.70,-3.70,-2.48,2.77,3.90,4.82,5.61,6.74,7.39,7.87,8.76};
+  float v_arr[V_PWM_NPTS] =  {-8.73,-7.86,-7.33,-6.98,-6.65,-5.57,-.35,-.25,-.15,.15,.25,.35,5.61,6.74,7.39,7.87,8.76};
   float pwm_arr[V_PWM_NPTS] = {-400,-350,-300,-275,-250,-200,-175,-150,-125,125,150,175,200,250,300,350,400};
   float slope;
   int i, res_pwm;
