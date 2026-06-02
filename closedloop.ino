@@ -1,6 +1,5 @@
 // Abby Paquette and Jesse Chan
-// ENGS 147
-// digital control on the motor
+// ENGS 147 final project
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -17,6 +16,9 @@
 
 
 ArduinoMotorShieldR3 md;
+
+#define refInput 0
+
 
 #define DEV_I2C Wire
 // #define LEDPIN 12
@@ -152,7 +154,6 @@ void loop() {
   unsigned long curtime, dt;  // note: long is a long INTEGER!
   long encoderValue = 0;
   float velocity, velocityUnConverted = 0;
-  float refInput = 1.57;
 
   static unsigned long fullStart = micros();
   static unsigned long curTimeRamp = 0;
@@ -165,52 +166,14 @@ void loop() {
   float rollRad = 0;
   uint16_t distanceMm = lastDistanceMm;
 
-  //mySensor.updateAccel();        //Update the Accelerometer data
-  //mySensor.updateLinearAccel();  //Update the Linear Acceleration data
+
   mySensor.updateGravAccel();    //Update the Gravity Acceleration data
   mySensor.updateCalibStatus();  //Update the Calibration Status
-  //mySensor.updateEuler();
 
-  // Serial.print(" roll: ");
-  // Serial.print(mySensor.readEulerRoll());  // Roll of the euler data
 
   //float theta = atan2(mySensor.readGravAccelX(), mySensor.readGravAccelZ()) * 180.0 / PI;
   float theta = atan2(mySensor.readGravAccelX(), mySensor.readGravAccelZ());
 
-
-  //rollRad = mySensor.readEulerRoll() * DEG_TO_RAD;
-
-  // Serial.print(" pitch: ");
-  // Serial.println(mySensor.readEulerPitch());  // Pitch of the euler data
-
-  // Non-blocking ToF polling: if the sensor stalls, continue running the rest of the code.
-  //status = sensor_vl53l4cd_sat.VL53L4CD_CheckForDataReady(&NewDataReady);
-
-  // if there is new data 
-  // if ((!status) && (NewDataReady != 0)) {
-  //   // (Mandatory) Clear HW interrupt to restart measurements
-  //   sensor_vl53l4cd_sat.VL53L4CD_ClearInterrupt();
-
-  //   // Read measured distance. RangeStatus = 0 means valid data
-  //   sensor_vl53l4cd_sat.VL53L4CD_GetResult(&results);
-
-  //   // Serial.print("Time: ");
-  //   // Serial.print(millis());
-  //   // Serial.print("ms ");
-
-  //   // Serial.print("      C: ");
-  //   // Serial.print(mySensor.readAccelCalibStatus());  //Accelerometer Calibration Status (0 - 3)
-
-  //   // Serial.println();
-
-  //   // flag for valid data
-  //   if(results.range_status == 0){
-  //     tofMeasurementValid = true;
-  //     distanceMm = results.distance_mm;
-  //     lastDistanceMm = distanceMm;
-  //     hasValidDistance = true;
-  //   }
-  // }
 
   switch(currentState) {
 
@@ -219,7 +182,6 @@ void loop() {
         md.setM1Speed(0);
         md.setM2Speed(0);
 
-        // digitalWrite(LEDPIN, LOW); // indicator led off
 
 
         // switch condition is elapsed time since reset, independent of ToF reliability
@@ -252,7 +214,6 @@ void loop() {
           encoders[timeidx] = -encoderValue; // negative here because of direction of encoder vs motor
           angle[timeidx] = (encoders[timeidx] - encoders[0])*SCALE; // turn into radians, make relative angle to start
 
-          //error[timeidx] = refInput - angle[timeidx]; // error in rad
           error[timeidx] = refInput - theta; // error in rad
 
           Serial.print(micros());
@@ -310,13 +271,6 @@ void loop() {
           md.setM1Speed(0);
           md.setM2Speed(0);
         }
-        // else if(results.distance_mm < 100) {
-        //   currentState = LANDED;
-        //   Serial.println("Was in air now landed");
-        //   md.setM1Speed(0);
-        //   md.setM2Speed(0);
-        // }
-
         break;
 
       case LANDED:
@@ -325,16 +279,6 @@ void loop() {
         // redundant command, but here just in case
         md.setM1Speed(0);
       
-        //Serial.println("Landed and motor off");
-
-        /*
-        // don't want this in this iteration, think if there should be a way to return to beginning
-        // condition shouldn't be distance based though
-        // think just pressing reset would be better
-        if(results.distance_mm < 50) {
-          currentState = ON_RAMP;
-        }
-        */
         break;
 
       // timeout and landed cases are currently the same, might collapse them into one, but for now preserving them as separate states
@@ -342,27 +286,8 @@ void loop() {
 
         md.setM1Speed(0);
 
-        /*
-        if(results.distance_mm < 50) {
-            currentState = ON_RAMP;
-        }
-        */
         break;
   }
-
-  // print all stored data to serial stream
-  // Serial.println("Timestamp, Motor_angle, Error, Commanded_voltage, Commanded_pwm_value");
-  // for(int i = 0; i<NUM_SAMPLES; i++){
-  //   Serial.print(times[i]);
-  //   Serial.print(",");
-  //   Serial.print(angle[i]);
-  //   Serial.print(",");
-  //   Serial.print(error[i]);
-  //   Serial.print(",");
-  //   Serial.print(vSignal[i]);
-  //   Serial.print(",");
-  //   Serial.println(pwmToSend[i]);
-  // }
 
 }
 
@@ -372,8 +297,9 @@ void loop() {
 int voltageToPWM(float V) {
   // hard-coded V, pwm values from calibration
   //float v_arr[V_PWM_NPTS] =  {-8.73,-7.86,-7.33,-6.98,-6.65,-5.57,-4.70,-3.70,-2.48,2.77,3.90,4.82,5.61,6.74,7.39,7.87,8.76};
-  float v_arr[V_PWM_NPTS] =  {-8.73,-7.86,-7.33,-6.98,-6.65,-5.57,-4.70,-3.70,-.5, -.25, .25, .5,3.90,4.82,5.61,6.74,7.39,7.87,8.76};
+  //float v_arr[V_PWM_NPTS] =  {-8.73,-7.86,-7.33,-6.98,-6.65,-5.57,-4.70,-3.70,-.5, -.25, .25, .5,3.90,4.82,5.61,6.74,7.39,7.87,8.76}; // good for zero
   //float v_arr[V_PWM_NPTS] =  {-8.73,-7.86,-7.33,-6.98,-6.65,-5.57,-.35,-.25,-.15,.15,.25,.35,5.61,6.74,7.39,7.87,8.76};
+  float v_arr[V_PWM_NPTS] =  {-8.73,-7.86,-7.33,-6.98,-6.65,-5.57,-.5,-.4,-.3,.3,.4,.5,5.61,6.74,7.39,7.87,8.76}; // for 90?
   float pwm_arr[V_PWM_NPTS] = {-400,-350,-300,-275,-250,-200,-175,-150,-125,0, 0, 125,150,175,200,250,300,350,400};
   float slope;
   int i, res_pwm;
