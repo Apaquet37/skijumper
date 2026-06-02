@@ -45,7 +45,7 @@ unsigned long startTime = 0;
 
 
 
-#define V_PWM_NPTS 17
+#define V_PWM_NPTS 19
 
 #define SCALE 3.14*2.0/1440.0 // combined scale factor for converting to radians (2pi rad per 1440 encoder counts)
 #define TIME_CONVERT 1.0e-6 // micros to seconds
@@ -59,15 +59,16 @@ unsigned long startTime = 0;
 
 #define D .05
 #define F .025
-#define TS 10000 // 10 ms in microseconds
-#define RECORD_TIME 20000000 // 10 s total duration of loop, in microseconds
+#define TS 100000 // 100 ms in microseconds
+#define RECORD_TIME 40000000 // 40 s total duration of loop, in microseconds
 #define NUM_SAMPLES (RECORD_TIME / TS)
+#define RAMP_EXIT_DELAY_US 500000 // leave ramp .5 s after reset
 
 #define DEG_TO_RAD 0.0174533
 
 #define GAIN 5.0 // K
-#define B .5 // pole location
-#define A .2 // zero location
+#define B 1 // pole location
+#define A .98 // zero location
 
 
 
@@ -89,25 +90,25 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Starting...");
 
-  // Initialize I2C bus
-  DEV_I2C.begin();
+  // // Initialize I2C bus
+  // DEV_I2C.begin();
 
-  // Configure VL53L4CD satellite component
-  sensor_vl53l4cd_sat.begin();
+  // // Configure VL53L4CD satellite component
+  // sensor_vl53l4cd_sat.begin();
 
-  // Switch off VL53L4CD satellite component
-  sensor_vl53l4cd_sat.VL53L4CD_Off();
+  // // Switch off VL53L4CD satellite component
+  // sensor_vl53l4cd_sat.VL53L4CD_Off();
 
-  //Initialize VL53L4CD satellite component
-  Serial.println("Line before initializing sensor"); 
-  sensor_vl53l4cd_sat.InitSensor();
-  Serial.println("sensor ready"); // often gets stuck initializing ToF sensor
+  // //Initialize VL53L4CD satellite component
+  // Serial.println("Line before initializing sensor"); 
+  // sensor_vl53l4cd_sat.InitSensor();
+  // Serial.println("sensor ready"); // often gets stuck initializing ToF sensor
 
-  // running very fast
-  sensor_vl53l4cd_sat.VL53L4CD_SetRangeTiming(10, 0);
+  // // running very fast
+  // sensor_vl53l4cd_sat.VL53L4CD_SetRangeTiming(10, 0);
 
-  // Start Measurements
-  sensor_vl53l4cd_sat.VL53L4CD_StartRanging();
+  // // Start Measurements
+  // sensor_vl53l4cd_sat.VL53L4CD_StartRanging();
 
   md.init(); // initialize motor shield
   initEncoderShield(); // initialize encoder shield
@@ -123,6 +124,10 @@ void setup() {
   updateSensorData = true;
   
   delay(200); // ensure all config is complete
+  Serial.println("setup done");
+  Serial.println("Timestamp, angle, Error, Commanded_voltage, Commanded_pwm_value");
+
+  
 
 }
 
@@ -147,7 +152,10 @@ void loop() {
   unsigned long curtime, dt;  // note: long is a long INTEGER!
   long encoderValue = 0;
   float velocity, velocityUnConverted = 0;
-  float refInput = 1.5;
+  float refInput = 1.57;
+
+  static unsigned long fullStart = micros();
+  static unsigned long curTimeRamp = 0;
 
   uint8_t NewDataReady = 0;
   bool tofMeasurementValid = false;
@@ -157,73 +165,74 @@ void loop() {
   float rollRad = 0;
   uint16_t distanceMm = lastDistanceMm;
 
-  mySensor.updateAccel();        //Update the Accelerometer data
+  //mySensor.updateAccel();        //Update the Accelerometer data
   //mySensor.updateLinearAccel();  //Update the Linear Acceleration data
-  //mySensor.updateGravAccel();    //Update the Gravity Acceleration data
+  mySensor.updateGravAccel();    //Update the Gravity Acceleration data
   mySensor.updateCalibStatus();  //Update the Calibration Status
-  mySensor.updateEuler();
+  //mySensor.updateEuler();
 
-  Serial.print(" roll: ");
-  Serial.print(mySensor.readEulerRoll());  // Roll of the euler data
+  // Serial.print(" roll: ");
+  // Serial.print(mySensor.readEulerRoll());  // Roll of the euler data
 
-  rollRad = mySensor.readEulerRoll() * DEG_TO_RAD;
+  //float theta = atan2(mySensor.readGravAccelX(), mySensor.readGravAccelZ()) * 180.0 / PI;
+  float theta = atan2(mySensor.readGravAccelX(), mySensor.readGravAccelZ());
 
-  Serial.print(" pitch: ");
-  Serial.println(mySensor.readEulerPitch());  // Pitch of the euler data
+
+  //rollRad = mySensor.readEulerRoll() * DEG_TO_RAD;
+
+  // Serial.print(" pitch: ");
+  // Serial.println(mySensor.readEulerPitch());  // Pitch of the euler data
 
   // Non-blocking ToF polling: if the sensor stalls, continue running the rest of the code.
-  status = sensor_vl53l4cd_sat.VL53L4CD_CheckForDataReady(&NewDataReady);
+  //status = sensor_vl53l4cd_sat.VL53L4CD_CheckForDataReady(&NewDataReady);
 
   // if there is new data 
-  if ((!status) && (NewDataReady != 0)) {
-    // (Mandatory) Clear HW interrupt to restart measurements
-    sensor_vl53l4cd_sat.VL53L4CD_ClearInterrupt();
+  // if ((!status) && (NewDataReady != 0)) {
+  //   // (Mandatory) Clear HW interrupt to restart measurements
+  //   sensor_vl53l4cd_sat.VL53L4CD_ClearInterrupt();
 
-    // Read measured distance. RangeStatus = 0 means valid data
-    sensor_vl53l4cd_sat.VL53L4CD_GetResult(&results);
+  //   // Read measured distance. RangeStatus = 0 means valid data
+  //   sensor_vl53l4cd_sat.VL53L4CD_GetResult(&results);
 
-    // Serial.print("Time: ");
-    // Serial.print(millis());
-    // Serial.print("ms ");
+  //   // Serial.print("Time: ");
+  //   // Serial.print(millis());
+  //   // Serial.print("ms ");
 
-    // Serial.print("      C: ");
-    // Serial.print(mySensor.readAccelCalibStatus());  //Accelerometer Calibration Status (0 - 3)
+  //   // Serial.print("      C: ");
+  //   // Serial.print(mySensor.readAccelCalibStatus());  //Accelerometer Calibration Status (0 - 3)
 
-    // Serial.println();
+  //   // Serial.println();
 
-    // flag for valid data
-    if(results.range_status == 0){
-      tofMeasurementValid = true;
-      distanceMm = results.distance_mm;
-      lastDistanceMm = distanceMm;
-      hasValidDistance = true;
-    }
-  }
+  //   // flag for valid data
+  //   if(results.range_status == 0){
+  //     tofMeasurementValid = true;
+  //     distanceMm = results.distance_mm;
+  //     lastDistanceMm = distanceMm;
+  //     hasValidDistance = true;
+  //   }
+  // }
 
   switch(currentState) {
 
       case ON_RAMP:
         // motor off
-        Serial.println("On ramp"); // debug
         md.setM1Speed(0);
         md.setM2Speed(0);
-        Serial.println("here"); // debug
 
         // digitalWrite(LEDPIN, LOW); // indicator led off
 
 
-        // switch condition is that it leaves the ramp
-        // could add in some debounce logic here to require two readings over 50
-        if(tofMeasurementValid && distanceMm > 50) {
+        // switch condition is elapsed time since reset, independent of ToF reliability
+        curTimeRamp = micros();
+        if(micros()-fullStart >= RAMP_EXIT_DELAY_US) {
           currentState = IN_AIR;
         
           // debug
-          Serial.println("Was on ramp now is in air");
-
           startTime = micros(); // take note of when motor turns on
           progstart = startTime;
           prevloopstart = startTime;
           running = false; // reset for first control loop iteration
+          timeidx = 0; // reset sample index for new run
         }
 
         break;
@@ -244,9 +253,15 @@ void loop() {
           angle[timeidx] = (encoders[timeidx] - encoders[0])*SCALE; // turn into radians, make relative angle to start
 
           //error[timeidx] = refInput - angle[timeidx]; // error in rad
-          error[timeidx] = refInput - rollRad; // error in rad
-          Serial.print("error:");
-          Serial.println(error[timeidx]);
+          error[timeidx] = refInput - theta; // error in rad
+
+          Serial.print(micros());
+          Serial.print(",   ");   
+          Serial.print(theta,   2);
+          Serial.print(",   ");
+          Serial.print(error[timeidx]);
+          Serial.print(",   ");
+
 
 
           // compensator as difference equation
@@ -257,10 +272,17 @@ void loop() {
           // } 
 
 
-          // just close loop, no compensator
+          // just proportional control
           vSignal[timeidx] = GAIN*error[timeidx];
           
           pwmToSend[timeidx] = voltageToPWM(vSignal[timeidx]);
+          
+          Serial.print(vSignal[timeidx]);
+          Serial.print(",   ");
+
+          Serial.println(pwmToSend[timeidx]);
+
+
 
           md.setM1Speed((int)pwmToSend[timeidx]);
           md.setM2Speed((int)pwmToSend[timeidx]);
@@ -303,7 +325,7 @@ void loop() {
         // redundant command, but here just in case
         md.setM1Speed(0);
       
-        Serial.println("Landed and motor off");
+        //Serial.println("Landed and motor off");
 
         /*
         // don't want this in this iteration, think if there should be a way to return to beginning
@@ -350,8 +372,9 @@ void loop() {
 int voltageToPWM(float V) {
   // hard-coded V, pwm values from calibration
   //float v_arr[V_PWM_NPTS] =  {-8.73,-7.86,-7.33,-6.98,-6.65,-5.57,-4.70,-3.70,-2.48,2.77,3.90,4.82,5.61,6.74,7.39,7.87,8.76};
-  float v_arr[V_PWM_NPTS] =  {-8.73,-7.86,-7.33,-6.98,-6.65,-5.57,-.35,-.25,-.15,.15,.25,.35,5.61,6.74,7.39,7.87,8.76};
-  float pwm_arr[V_PWM_NPTS] = {-400,-350,-300,-275,-250,-200,-175,-150,-125,125,150,175,200,250,300,350,400};
+  float v_arr[V_PWM_NPTS] =  {-8.73,-7.86,-7.33,-6.98,-6.65,-5.57,-4.70,-3.70,-.5, -.25, .25, .5,3.90,4.82,5.61,6.74,7.39,7.87,8.76};
+  //float v_arr[V_PWM_NPTS] =  {-8.73,-7.86,-7.33,-6.98,-6.65,-5.57,-.35,-.25,-.15,.15,.25,.35,5.61,6.74,7.39,7.87,8.76};
+  float pwm_arr[V_PWM_NPTS] = {-400,-350,-300,-275,-250,-200,-175,-150,-125,0, 0, 125,150,175,200,250,300,350,400};
   float slope;
   int i, res_pwm;
 
